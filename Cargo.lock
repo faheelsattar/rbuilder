@@ -7743,6 +7743,7 @@ dependencies = [
  "atoi",
  "beacon-api-client",
  "bigdecimal 0.4.6",
+ "blst",
  "built",
  "clap 4.5.21",
  "criterion 0.5.1",

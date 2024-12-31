@@ -4,6 +4,7 @@ use clap::Parser;
 use reth::revm::cached::CachedReads;
 use reth_db::Database;
 use reth_provider::{BlockReader, DatabaseProviderFactory, HeaderProvider, StateProviderFactory};
+use revm_primitives::hex;
 use serde::de::DeserializeOwned;
 use std::fmt::Debug;
 use sysperf::{format_results, gather_system_info, run_all_benchmarks};
@@ -16,7 +17,7 @@ use crate::{
         base_config::load_config_toml_and_env, payload_events::MevBoostSlotDataGenerator,
     },
     telemetry,
-    utils::build_info::Version,
+    utils::{bls::generate_random_bls_address, build_info::Version},
 };
 
 use super::{base_config::BaseConfig, LiveBuilder};
@@ -34,6 +35,8 @@ enum Cli {
         about = "Run system performance benchmarks (CPU, disk, memory)"
     )]
     SysPerf,
+    #[clap(name = "gen-bls", about = "Generate a BLS signature")]
+    GenBls,
 }
 
 #[derive(Parser, Debug)]
@@ -104,6 +107,11 @@ where
 
             let sysinfo = gather_system_info();
             println!("{}", format_results(&result, &sysinfo));
+            return Ok(());
+        }
+        Cli::GenBls => {
+            let address = generate_random_bls_address();
+            println!("0x{}", hex::encode(address));
             return Ok(());
         }
     };
