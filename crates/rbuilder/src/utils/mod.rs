@@ -1,4 +1,5 @@
 //! a2r prefix = alloy to reth conversion
+pub mod bls;
 pub mod build_info;
 pub mod constants;
 pub mod error_storage;
@@ -13,7 +14,6 @@ pub mod provider_head_state;
 #[cfg(test)]
 pub mod test_utils;
 pub mod tracing;
-pub mod bls;
 
 use alloy_network::Ethereum;
 use alloy_primitives::{Address, Sign, I256, U256};
