@@ -17,10 +17,6 @@ mod tests {
     #[test]
     fn test_generate_random_bls_address() {
         let bls_address = generate_random_bls_address();
-        assert_eq!(
-            bls_address.as_bytes().len(),
-            96,
-            "BLS address should be of 96 length"
-        );
+        assert_eq!(bls_address.len(), 96, "BLS address should be of 96 length");
     }
 }
