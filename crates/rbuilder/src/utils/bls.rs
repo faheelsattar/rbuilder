@@ -1,13 +1,13 @@
-use blst::min_pk::SecretKey;
-use rand::{self, RngCore};
+use ethereum_consensus::crypto::SecretKey;
+use rand;
+use revm_primitives::hex;
 
-pub fn generate_random_bls_address() -> [u8; 48] {
+pub fn generate_random_bls_address() -> String {
     let mut rng = rand::thread_rng();
-    let mut ikm = [0u8; 32];
-    rng.fill_bytes(&mut ikm);
-    let sk = SecretKey::key_gen(&ikm, &[]).unwrap();
-    let pk = sk.sk_to_pk();
-    pk.compress()
+    let sk = SecretKey::random(&mut rng).unwrap();
+    let pk = sk.public_key();
+    let raw_bytes = pk.as_ref();
+    hex::encode(raw_bytes)
 }
 
 #[cfg(test)]
@@ -17,6 +17,10 @@ mod tests {
     #[test]
     fn test_generate_random_bls_address() {
         let bls_address = generate_random_bls_address();
-        assert_eq!(bls_address.len(), 48, "BLS address should be of 48 length");
+        assert_eq!(
+            bls_address.as_bytes().len(),
+            96,
+            "BLS address should be of 96 length"
+        );
     }
 }
