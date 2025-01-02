@@ -619,13 +619,14 @@ mod test {
 
         let config: Config = load_config_toml_and_env(p.clone()).expect("Config load");
 
-        assert_eq!(
-            config
+        assert!(
+            !config
                 .base_config
                 .coinbase_signer()
-                .expect_err("should be error")
-                .to_string(),
-            "Env variable: COINBASE_SECRET_KEY not set"
+                .expect("Coinbase signer")
+                .address
+                .is_empty(),
+            "Address should not be empty"
         );
 
         env::set_var(
