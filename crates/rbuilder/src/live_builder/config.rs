@@ -42,7 +42,8 @@ use alloy_primitives::{
     FixedBytes, B256,
 };
 use ethereum_consensus::{
-    builder::compute_builder_domain, primitives::Version, state_transition::Context as ContextEth,
+    builder::compute_builder_domain, crypto::SecretKey, primitives::Version,
+    state_transition::Context as ContextEth,
 };
 use eyre::Context;
 use reth::revm::cached::CachedReads;
@@ -55,8 +56,6 @@ use reth_provider::{
     BlockReader, DatabaseProviderFactory, HeaderProvider, StateProviderFactory,
     StaticFileProviderFactory,
 };
-use revm_primitives::hex;
-use secp256k1::SecretKey;
 use serde::Deserialize;
 use serde_with::{serde_as, OneOrMany};
 use std::{
@@ -205,8 +204,15 @@ impl L1Config {
             self.genesis_fork_version.clone(),
         )?;
 
-        let relay_secret_key = self.get_relay_secret_key();
-        let signer = BLSBlockSigner::from_string(relay_secret_key, signing_domain)
+        let relay_secret_key = if let Some(secret_key) = &self.relay_secret_key {
+            let resolved_key = secret_key.value()?;
+            SecretKey::try_from(resolved_key)?
+        } else {
+            warn!("No relay secret key provided. A random key will be generated.");
+            SecretKey::random(&mut rand::thread_rng())?
+        };
+
+        let signer = BLSBlockSigner::new(relay_secret_key, signing_domain)
             .map_err(|e| eyre::eyre!("Failed to create normal signer: {:?}", e))?;
 
         let optimistic_signer = if self.optimistic_enabled {
@@ -269,17 +275,6 @@ impl L1Config {
             relays.clone(),
         ));
         Ok((sink_factory, relays))
-    }
-
-    fn get_relay_secret_key(&self) -> String {
-        if let Some(secret_key) = &self.relay_secret_key {
-            if let Ok(resolved_key) = secret_key.value() {
-                return resolved_key;
-            }
-        }
-        warn!("No relay secret key provided. A random key will be generated.");
-        let secret_key = SecretKey::new(&mut rand::thread_rng());
-        hex::encode(secret_key.secret_bytes())
     }
 }
 
