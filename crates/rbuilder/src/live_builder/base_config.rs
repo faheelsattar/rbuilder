@@ -285,9 +285,7 @@ impl BaseConfig {
 
     pub fn coinbase_signer(&self) -> eyre::Result<Signer> {
         if let Some(secret_key) = &self.coinbase_secret_key {
-            if let Ok(resolved_key) = secret_key.value() {
-                return coinbase_signer_from_secret_key(&resolved_key);
-            }
+            return coinbase_signer_from_secret_key(&secret_key.value()?);
         }
         warn!("No coinbase secret key provided. A random key will be generated.");
         warn!(
