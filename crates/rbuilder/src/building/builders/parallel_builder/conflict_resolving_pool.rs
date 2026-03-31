@@ -1,6 +1,6 @@
 use alloy_primitives::utils::format_ether;
 use crossbeam_queue::SegQueue;
-use eyre::Result;
+use eyre::Report;
 use reth_provider::StateProvider;
 use std::{
     sync::{mpsc as std_mpsc, Arc},
@@ -18,6 +18,17 @@ use super::{
 use crate::{building::BlockBuildingContext, provider::StateProviderFactory, utils::elapsed_ms};
 
 pub type TaskQueue = Arc<SegQueue<ConflictTask>>;
+
+#[derive(Debug, thiserror::Error)]
+enum ConflictTaskProcessError {
+    #[error("failed to run conflict task {task_type:?} for group {group_id}: {source}")]
+    RunConflictTask {
+        group_id: GroupId,
+        task_type: TaskPriority,
+        #[source]
+        source: Report,
+    },
+}
 
 pub struct ConflictResolvingPool<P> {
     task_queue: TaskQueue,
@@ -76,29 +87,40 @@ where
                             return;
                         }
                         let task_start = Instant::now();
-                        if let Ok((task_id, result)) = Self::process_task(
+                        match Self::process_task(
                             task,
                             &ctx,
                             block_state.clone(),
                             cancellation_token.clone(),
                             Arc::clone(&simulation_cache),
                         ) {
-                            match group_result_sender.send((task_id, result)) {
-                                Ok(_) => {
-                                    trace!(
-                                                        task_id = %task_id,
-                                    time_taken_ms = %elapsed_ms(task_start),
-                                                        "Conflict resolving: successfully sent group result"
-                                                    );
+                            Ok((task_id, result)) => {
+                                match group_result_sender.send((task_id, result)) {
+                                    Ok(_) => {
+                                        trace!(
+                                            task_id = %task_id,
+                                            time_taken_ms = %elapsed_ms(task_start),
+                                            "Conflict resolving: successfully sent group result"
+                                        );
+                                    }
+                                    Err(err) => {
+                                        warn!(
+                                            task_id = %task_id,
+                                            error = ?err,
+                                            time_taken_ms = %elapsed_ms(task_start),
+                                            "Conflict resolving: failed to send group result"
+                                        );
+                                        return;
+                                    }
                                 }
-                                Err(err) => {
+                            }
+                            Err(err) => {
+                                if !cancellation_token.is_cancelled() {
                                     warn!(
-                                                        task_id = %task_id,
-                                                        error = ?err,
-                                    time_taken_ms = %elapsed_ms(task_start),
-                                                        "Conflict resolving: failed to send group result"
-                                                    );
-                                    return;
+                                        error = %err,
+                                        time_taken_ms = %elapsed_ms(task_start),
+                                        "Conflict resolving: failed to process task"
+                                    );
                                 }
                             }
                         }
@@ -115,7 +137,7 @@ where
         state: Arc<dyn StateProvider>,
         cancellation_token: CancellationToken,
         simulation_cache: Arc<SharedSimulationCache>,
-    ) -> Result<(GroupId, (ResolutionResult, ConflictGroup))> {
+    ) -> Result<(GroupId, (ResolutionResult, ConflictGroup)), ConflictTaskProcessError> {
         let mut merging_context = ResolverContext::new(
             state,
             ctx.clone(),
@@ -138,16 +160,19 @@ where
                 Ok((task_id, (sequence_of_orders, task_group)))
             }
             Err(err) => {
-                // Fast patch/heuristic to fix excessive tracing.
-                // TODO: Use good errors.
                 if !cancellation_token.is_cancelled() {
                     warn!(
                         group_id = task_id,
-                        err = ?err,
-                        "Error running conflict task for group_idx",
+                        task_type = ?task_algo,
+                        error = ?err,
+                        "Conflict resolving: error while running conflict task",
                     );
                 }
-                Err(err)
+                Err(ConflictTaskProcessError::RunConflictTask {
+                    group_id: task_id,
+                    task_type: task_algo,
+                    source: err,
+                })
             }
         }
     }
@@ -171,8 +196,11 @@ where
                     CancellationToken::new(),
                     simulation_cache,
                 );
-                if let Ok(result) = result {
-                    results.push(result);
+                match result {
+                    Ok(result) => results.push(result),
+                    Err(err) => {
+                        warn!(error = %err, "Conflict resolving backtest: failed to process task");
+                    }
                 }
             }
         }
