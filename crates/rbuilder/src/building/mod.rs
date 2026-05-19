@@ -42,21 +42,19 @@ use rbuilder_primitives::{
     mev_boost::BidAdjustmentData, BlockSpace, Order, SimValue, SimulatedOrder,
     TransactionSignedEcRecoveredWithBlobs,
 };
-use reth::{
-    payload::PayloadId,
-    primitives::{Block, SealedBlock},
-};
+use reth::payload::PayloadId;
 use reth_chainspec::{ChainSpec, EthChainSpec, EthereumHardforks};
 use reth_errors::{BlockExecutionError, BlockValidationError, ProviderError};
+use reth_ethereum_primitives::Block;
+use reth_ethereum_primitives::BlockBody;
 use reth_evm::{ConfigureEvm, NextBlockEnvAttributes};
 use reth_evm_ethereum::{revm_spec_by_timestamp_and_block_number, EthEvmConfig};
-use reth_node_api::{EngineApiMessageVersion, PayloadBuilderAttributes};
-use reth_payload_builder::EthPayloadBuilderAttributes;
-use reth_primitives::BlockBody;
+use reth_node_api::payload_id;
+use reth_primitives_traits::SealedBlock;
 use reth_primitives_traits::{proofs, Block as _};
 use revm::{
     context_interface::result::InvalidTransaction, database::states::bundle_state::BundleRetention,
-    primitives::hardfork::SpecId,
+    database_interface::DatabaseCommitExt, primitives::hardfork::SpecId,
 };
 use serde::Deserialize;
 use std::{
@@ -69,7 +67,7 @@ use std::{
 };
 use thiserror::Error;
 use time::OffsetDateTime;
-use tracing::{error, trace};
+use tracing::{debug, error, trace};
 use tx_sim_cache::TxExecutionCache;
 
 pub mod bid_adjustments;
@@ -96,6 +94,66 @@ pub use self::{
 
 #[cfg(test)]
 pub use conflict::*;
+
+/// Local replacement for the removed `reth_ethereum_engine_primitives::EthPayloadBuilderAttributes`.
+/// Contains all the fields needed for block building from payload attributes.
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct EthPayloadBuilderAttributes {
+    /// Id of the payload
+    pub id: PayloadId,
+    /// Parent block to build the payload on top
+    pub parent: B256,
+    /// Unix timestamp for the generated payload
+    pub timestamp: u64,
+    /// Address of the recipient for collecting transaction fee
+    pub suggested_fee_recipient: Address,
+    /// Randomness value for the generated payload
+    pub prev_randao: B256,
+    /// Withdrawals for the generated payload
+    pub withdrawals: Withdrawals,
+    /// Root of the parent beacon block
+    pub parent_beacon_block_root: Option<B256>,
+    /// Beacon slot for the payload. `Some` post glamsterdam (EIP-8037),
+    /// `None` for pre-fork blocks.
+    pub slot_number: Option<u64>,
+}
+
+impl EthPayloadBuilderAttributes {
+    /// Creates a new payload builder attributes from the parent hash and payload attributes.
+    pub fn new(parent: B256, attributes: alloy_rpc_types_engine::PayloadAttributes) -> Self {
+        let id = payload_id(&parent, &attributes);
+        Self {
+            id,
+            parent,
+            timestamp: attributes.timestamp,
+            suggested_fee_recipient: attributes.suggested_fee_recipient,
+            prev_randao: attributes.prev_randao,
+            withdrawals: attributes.withdrawals.unwrap_or_default().into(),
+            parent_beacon_block_root: attributes.parent_beacon_block_root,
+            slot_number: attributes.slot_number,
+        }
+    }
+
+    /// Returns the timestamp.
+    pub fn timestamp(&self) -> u64 {
+        self.timestamp
+    }
+
+    /// Returns the suggested fee recipient.
+    pub fn suggested_fee_recipient(&self) -> Address {
+        self.suggested_fee_recipient
+    }
+
+    /// Returns the prev randao.
+    pub fn prev_randao(&self) -> B256 {
+        self.prev_randao
+    }
+
+    /// Returns the parent beacon block root.
+    pub fn parent_beacon_block_root(&self) -> Option<B256> {
+        self.parent_beacon_block_root
+    }
+}
 
 /// Estimated overhead for the whole block header rlp length
 const BLOCK_HEADER_RLP_OVERHEAD: usize = 1024;
@@ -148,12 +206,15 @@ impl BlockBuildingContext {
         mev_blocker_price: U256,
         adjustment_fee_payers: ahash::HashSet<Address>,
     ) -> Option<BlockBuildingContext> {
-        let attributes = EthPayloadBuilderAttributes::try_new(
+        let proposal_slot = attributes.data.proposal_slot;
+        let mut attributes = EthPayloadBuilderAttributes::new(
             attributes.data.parent_block_hash,
             attributes.data.payload_attributes.clone(),
-            EngineApiMessageVersion::default() as u8,
-        )
-        .expect("PayloadBuilderAttributes::try_new");
+        );
+
+        if chain_spec.is_amsterdam_active_at_timestamp(attributes.timestamp) {
+            attributes.slot_number = Some(proposal_slot);
+        }
         let eth_evm_config = EthEvmConfig::new(chain_spec.clone());
         let gas_limit = calculate_block_gas_limit(
             parent.gas_limit,
@@ -171,6 +232,8 @@ impl BlockBuildingContext {
                     gas_limit,
                     withdrawals: Some(attributes.withdrawals.clone()),
                     parent_beacon_block_root: attributes.parent_beacon_block_root,
+                    extra_data: Default::default(),
+                    slot_number: attributes.slot_number,
                 },
             )
             .ok()?;
@@ -273,6 +336,7 @@ impl BlockBuildingContext {
             prev_randao: onchain_block.header.mix_hash,
             withdrawals,
             parent_beacon_block_root: onchain_block.header.parent_beacon_block_root,
+            slot_number: onchain_block.header.slot_number,
         };
         let spec_id = spec_id.unwrap_or_else(|| {
             // we use current block data instead of the parent block data to determine fork
@@ -493,6 +557,14 @@ impl BlockBuildingSpaceState {
         self.space_used.gas
     }
 
+    pub fn regular_gas_used(&self) -> u64 {
+        self.space_used.regular_gas
+    }
+
+    pub fn state_gas_used(&self) -> u64 {
+        self.space_used.state_gas
+    }
+
     pub fn blob_gas_used(&self) -> u64 {
         self.space_used.blob_gas
     }
@@ -607,7 +679,7 @@ impl ExecutionError {
 
 pub struct FinalizeResult {
     /// Sealed block.
-    pub sealed_block: SealedBlock,
+    pub sealed_block: SealedBlock<Block>,
     // sidecars for all txs in SealedBlock
     pub txs_blob_sidecars: Vec<Arc<BlobTransactionSidecarVariant>>,
     /// The Pectra execution requests for this bid.
@@ -616,6 +688,9 @@ pub struct FinalizeResult {
     pub bid_adjustments: HashMap<Address, BidAdjustmentData>,
     /// Duration of root hash calculation.
     pub root_hash_time: Duration,
+    /// EIP-7928 rlp encoded BAL. `Some` post glamsterdam,`None`
+    /// pre-Amsterdam.
+    pub block_access_list: Option<Bytes>,
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -946,6 +1021,8 @@ impl<Tracer: SimulationTracer, PartialBlockExecutionTracerType: PartialBlockExec
                         withdrawal.amount_wei().to::<u128>();
                 }
             }
+            // filter zero value entries so we don't churn the BAL with no-ops.
+            balance_increments.retain(|_, balance| *balance > 0);
             db.db()
                 .increment_balances(balance_increments)
                 .map_err(|_| {
@@ -1081,6 +1158,57 @@ impl<Tracer: SimulationTracer, PartialBlockExecutionTracerType: PartialBlockExec
         let blobs_time_ms = elapsed_ms(step_start);
         let step_start = Instant::now();
 
+        // extract the accumulated EIP-7928 BAL built up across per tx
+        // revm state commits. `None` pre ammsterdam, post ammsterdam this carries
+        // the rlp encoded BAL bytes that get both hashed into the header ans shipped to the relay in the payload.
+        // Take the canonical `alloy_eips::eip7928::BlockAccessList` (=
+        // `Vec<AccountChanges>`) accumulated by revm during execution. We hash
+        // and rlp encoded it via the same helper reths validator uses
+        // (`compute_block_access_list_hash`, see consensus/src/validation.rs:93)
+        // so the header hash and the wire bytes are derived identically on
+        // both sides.
+        let built_bal = state.take_built_bal();
+        let is_amsterdam = ctx
+            .chain_spec
+            .is_amsterdam_active_at_timestamp(ctx.attributes.timestamp);
+        let block_access_list_hash = is_amsterdam.then(|| {
+            alloy_eips::eip7928::compute_block_access_list_hash(built_bal.as_deref().unwrap_or(&[]))
+        });
+        // rlp encode the BAL into the payload bytes we ship in the envelope.
+        // Encode via `encode_list` so the onthewire bytes match exactly what
+        // reth-validator decodes back into `BlockAccessList` before hashing.
+        let block_access_list = built_bal.as_ref().map(|bal| {
+            let mut buf = Vec::new();
+            alloy_rlp::encode_list(bal.as_slice(), &mut buf);
+            alloy_primitives::Bytes::from(buf)
+        });
+
+        // EIP-8037 (Amsterdam) splits block gas into regular and state gas,
+        // each bounded by `gas_limit` independently. The header `gas_used`
+        // is `max(regular, state)` — matches alloy-evm's
+        // EthBlockExecutor::finish, which is what the consensus validator
+        // re-derives in validate_block_post_execution. Pre-Amsterdam we keep
+        // the old behavior (cumulative tx_gas_used).
+        let tx_gas_used = self.space_state.gas_used();
+        let regular_gas_used = self.space_state.regular_gas_used();
+        let state_gas_used = self.space_state.state_gas_used();
+        let header_gas_used = if is_amsterdam {
+            regular_gas_used.max(state_gas_used)
+        } else {
+            tx_gas_used
+        };
+
+        debug!(
+            block_number,
+            is_amsterdam,
+            tx_count = self.executed_tx_infos.len(),
+            tx_gas_used,
+            regular_gas_used,
+            state_gas_used,
+            header_gas_used,
+            "Sealing block header gas accounting"
+        );
+
         let header = Header {
             parent_hash: ctx.attributes.parent,
             ommers_hash: EMPTY_OMMER_ROOT_HASH,
@@ -1097,12 +1225,14 @@ impl<Tracer: SimulationTracer, PartialBlockExecutionTracerType: PartialBlockExec
             number: block_number,
             gas_limit: ctx.evm_env.block_env.gas_limit,
             difficulty: U256::ZERO,
-            gas_used: self.space_state.gas_used(),
+            gas_used: header_gas_used,
             extra_data: ctx.extra_data.clone().into(),
             parent_beacon_block_root: ctx.attributes.parent_beacon_block_root,
             blob_gas_used,
             excess_blob_gas,
             requests_hash,
+            block_access_list_hash,
+            slot_number: ctx.attributes.slot_number,
         };
 
         let withdrawals = ctx
@@ -1167,6 +1297,7 @@ impl<Tracer: SimulationTracer, PartialBlockExecutionTracerType: PartialBlockExec
             root_hash_time,
             execution_requests: requests.map(Requests::take).unwrap_or_default(),
             bid_adjustments,
+            block_access_list,
         };
         let block_seal_time_ms = elapsed_ms(step_start);
         let total_time_ms = elapsed_ms(start);
@@ -1204,9 +1335,14 @@ impl<Tracer: SimulationTracer, PartialBlockExecutionTracerType: PartialBlockExec
         let mut system_caller = SystemCaller::new(ctx.chain_spec.clone());
         let mut evm = EthEvmConfig::new(ctx.chain_spec.clone())
             .evm_with_env(db.as_mut(), ctx.evm_env.clone());
+        // blockhashes (EIP-2935) first, then beacon root
+        // (EIP-4788). The order matters for the EIP-7928 BAL: each system-call
+        // access is tagged with a sequence index, so swapping the two changes
+        // every BAL byte and causes `block_access_list_hash` mismatches against
+        // reth-validator on reveal.
+        system_caller.apply_blockhashes_contract_call(ctx.attributes.parent, &mut evm)?;
         system_caller
             .apply_beacon_root_contract_call(ctx.attributes.parent_beacon_block_root(), &mut evm)?;
-        system_caller.apply_blockhashes_contract_call(ctx.attributes.parent, &mut evm)?;
         db.as_mut().merge_transitions(BundleRetention::Reverts);
         Ok(())
     }

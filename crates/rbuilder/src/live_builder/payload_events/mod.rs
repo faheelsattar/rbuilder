@@ -33,6 +33,13 @@ use super::block_list_provider::BlockListProvider;
 const RECENTLY_SENT_EVENTS_BUFF: usize = 10;
 const NEW_PAYLOAD_RECV_TIMEOUT: Duration = SLOT_DURATION.saturating_mul(2);
 
+// TODO(prysm-buildoor-apis): Remove this workaround once Prysm's
+// `bharath-123-buildoor-apis` branch is patched to populate the SSE
+// `payload_attributes` event's `parent_block_number` field correctly. Today
+// it always reports "0" post-Gloas, which breaks rbuilder's state-root
+// computation
+pub type ParentNumberResolver = Arc<dyn Fn(B256) -> Option<u64> + Send + Sync>;
+
 /// If connection to the consensus client if broken we wait this time.
 /// One slot (12secs) is enough so we don't saturate any resource and we don't miss to many slots.
 const CONSENSUS_CLIENT_RECONNECT_WAIT: Duration = SLOT_DURATION;
@@ -58,6 +65,10 @@ pub struct MevBoostSlotData {
 impl MevBoostSlotData {
     pub fn parent_block_hash(&self) -> B256 {
         self.payload_attributes_event.data.parent_block_hash
+    }
+
+    pub fn parent_block_root(&self) -> B256 {
+        self.payload_attributes_event.data.parent_block_root
     }
 
     pub fn parent_block_num_hash(&self) -> BlockNumHash {
@@ -100,7 +111,8 @@ impl MevBoostSlotData {
 /// - Call MevBoostSlotDataGenerator::spawn.
 /// - Poll new slots via the returned UnboundedReceiver on spawn.
 /// - If join with spawned task is needed await on the JoinHandle returned by spawn.
-#[derive(Debug)]
+#[derive(derivative::Derivative)]
+#[derivative(Debug)]
 pub struct MevBoostSlotDataGenerator {
     cls: Vec<Client>,
     relays: Vec<MevBoostRelaySlotInfoProvider>,
@@ -108,6 +120,9 @@ pub struct MevBoostSlotDataGenerator {
     adjustment_fee_payers: HashMap<MevBoostRelayID, Address>,
     blocklist_provider: Arc<dyn BlockListProvider>,
     global_cancellation: CancellationToken,
+    /// See [`ParentNumberResolver`]; `None` disables the workaround
+    #[derivative(Debug = "ignore")]
+    parent_number_resolver: Option<ParentNumberResolver>,
 }
 
 impl MevBoostSlotDataGenerator {
@@ -118,6 +133,7 @@ impl MevBoostSlotDataGenerator {
         adjustment_fee_payers: HashMap<MevBoostRelayID, Address>,
         blocklist_provider: Arc<dyn BlockListProvider>,
         global_cancellation: CancellationToken,
+        parent_number_resolver: Option<ParentNumberResolver>,
     ) -> Self {
         Self {
             cls,
@@ -126,6 +142,7 @@ impl MevBoostSlotDataGenerator {
             adjustment_fee_payers,
             blocklist_provider,
             global_cancellation,
+            parent_number_resolver,
         }
     }
 
@@ -162,13 +179,34 @@ impl MevBoostSlotDataGenerator {
             let mut relays = relays;
             let mut recently_sent_data = VecDeque::with_capacity(RECENTLY_SENT_EVENTS_BUFF);
 
-            while let Some(event) = source.recv().await {
+            while let Some(mut event) = source.recv().await {
                 if self.global_cancellation.is_cancelled() {
                     return;
                 }
 
                 let payload_id: InternalPayloadId = payload_counter;
                 payload_counter += 1;
+
+                // TODO(prysm-buildoor-apis): see ParentNumberResolver. prysms
+                // `bharath-123-buildoor-apis` branch sends `parent_block_number=0`
+                // in post gloas ss events while keeping `parent_block_hash`
+                // valid. Recover the real number from the el to keep the
+                // (number, hash) pair internally consistent for state-root
+                // computation.
+                if event.data.parent_block_number == 0 && event.data.parent_block_hash != B256::ZERO
+                {
+                    if let Some(resolver) = self.parent_number_resolver.as_ref() {
+                        if let Some(real_number) = resolver(event.data.parent_block_hash) {
+                            event.data.parent_block_number = real_number;
+                        } else {
+                            warn!(
+                                payload_id,
+                                parent_hash = ?event.data.parent_block_hash,
+                                "SSE parent_block_number=0 but EL provider could not resolve it"
+                            );
+                        }
+                    }
+                }
 
                 let slot = event.data.proposal_slot;
                 let block = event.data.parent_block_number + 1;
@@ -184,8 +222,37 @@ impl MevBoostSlotDataGenerator {
                     "Payload attributes received from CL client"
                 );
 
-                let (slot_data, relay_registrations) = if let Some(res) = relays.slot_data(slot) {
-                    res
+                let (slot_data, relay_registrations, correct_event) = if let Some((sd, rr)) =
+                    relays.slot_data(slot)
+                {
+                    let mut ev = event;
+                    ev.data.payload_attributes.suggested_fee_recipient = sd.fee_recipient;
+                    info!(payload_id, address = ?sd.fee_recipient, "Payload attributes correct fee recipient set from relay");
+                    (sd, rr, ev)
+                } else if self.relays.is_empty() {
+                    // EPBS mode: no relays configured, use CL-provided payload attributes as is.
+                    // The fee_recipient comes from the CL's suggested_fee_recipient (payload attributes),
+                    // and gas_limit from the default block gas limit.
+                    let fee_recipient = event.data.payload_attributes.suggested_fee_recipient;
+                    info!(
+                        payload_id,
+                        ?fee_recipient,
+                        "No relays configured, using CL payload attributes directly (EPBS mode)"
+                    );
+                    // TODO: per consensus-specs gloas/p2p-interface.md
+                    // `bid.gas_limit` MUST equal `ProposerPreferences.gas_limit`
+                    // for the slot. Until we receive prefs reliably via SSE,
+                    // hardcode the gas_limit Prysm validators actually sign
+                    // for testing purpose i am currently setting 150_000_000,
+                    // but it should be derived from the proposer preferences
+                    // to pass the p2p validation.
+                    let sd = SlotData {
+                        fee_recipient,
+                        gas_limit: 150_000_000,
+                        pubkey: alloy_rpc_types_beacon::BlsPublicKey::ZERO,
+                    };
+                    let rr = Arc::new(HashMap::default());
+                    (sd, rr, event)
                 } else {
                     info!(
                         payload_id,
@@ -194,20 +261,6 @@ impl MevBoostSlotDataGenerator {
                     );
                     continue;
                 };
-
-                info!(
-                    payload_id,
-                    ?slot_data,
-                    ?relay_registrations,
-                    "Slot data from relays received"
-                );
-
-                let mut correct_event = event;
-                correct_event
-                    .data
-                    .payload_attributes
-                    .suggested_fee_recipient = slot_data.fee_recipient;
-                info!(payload_id, address = ?slot_data.fee_recipient, "Payload attributes correct fee recipient set");
 
                 let mev_boost_slot_data = MevBoostSlotData {
                     payload_attributes_event: correct_event,

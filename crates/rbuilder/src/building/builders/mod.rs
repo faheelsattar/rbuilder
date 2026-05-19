@@ -19,7 +19,9 @@ use ahash::HashSet;
 use alloy_eips::eip7594::BlobTransactionSidecarVariant;
 use alloy_primitives::{Address, Bytes};
 use rbuilder_primitives::{mev_boost::BidAdjustmentData, AccountNonce, OrderId, SimulatedOrder};
-use reth::primitives::SealedBlock;
+use reth_primitives_traits::SealedBlock;
+
+type EthSealedBlock = SealedBlock<reth_ethereum_primitives::Block>;
 use std::{
     collections::HashMap,
     fmt::Debug,
@@ -43,13 +45,18 @@ use super::{simulated_order_command_to_sink, OrderPriority, PrioritizedOrderStor
 pub struct Block {
     pub builder_name: String,
     pub trace: BuiltBlockTrace,
-    pub sealed_block: SealedBlock,
+    pub sealed_block: EthSealedBlock,
     /// Sidecars for the txs included in SealedBlock
     pub txs_blobs_sidecars: Vec<Arc<BlobTransactionSidecarVariant>>,
     /// The Pectra execution requests for this bid.
     pub execution_requests: Vec<Bytes>,
     /// Bid adjustment data by fee payer address.
     pub bid_adjustments: HashMap<Address, BidAdjustmentData>,
+    /// EIP-7928 rlp encoded BAL, populated post amsterdam from
+    /// the EVM executor (`BlockBuilderOutcome.block_access_list`). `None`
+    /// pre amsterdam. Required to populate `ExecutionPayloadGloas.block_access_list`
+    /// in the EPBS envelope.
+    pub block_access_list: Option<Bytes>,
 }
 
 /// Id to uniquely identify every block built (unique even among different algorithms).

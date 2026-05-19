@@ -1,5 +1,6 @@
+use crate::building::SyncStateProvider;
 use alloy_primitives::{utils::format_ether, Address, TxHash, I256, U256};
-use reth_provider::StateProvider;
+use reth_chainspec::EthereumHardforks;
 use std::{
     cmp::max,
     sync::Arc,
@@ -36,7 +37,7 @@ use super::Block;
 /// 2 - Call lots of commit_order.
 /// 3 - Call set_trace_fill_time when you are done calling commit_order (we still have to review this step).
 /// 4 - Call finalize_block.
-pub trait BlockBuildingHelper: Send + Sync {
+pub trait BlockBuildingHelper: Send {
     fn box_clone(&self) -> Box<dyn BlockBuildingHelper>;
 
     /// Tries to add an order to the end of the block.
@@ -213,7 +214,7 @@ impl BlockBuildingHelperFromProvider<NullPartialBlockExecutionTracer> {
     #[allow(clippy::too_many_arguments)]
     pub fn new(
         built_block_id: BuiltBlockId,
-        state_provider: Arc<dyn StateProvider>,
+        state_provider: Arc<SyncStateProvider>,
         building_ctx: BlockBuildingContext,
         local_ctx: &mut ThreadBlockBuildingContext,
         builder_name: String,
@@ -249,7 +250,7 @@ impl<
     #[allow(clippy::too_many_arguments)]
     pub fn new_with_execution_tracer(
         built_block_id: BuiltBlockId,
-        state_provider: Arc<dyn StateProvider>,
+        state_provider: Arc<SyncStateProvider>,
         building_ctx: BlockBuildingContext,
         local_ctx: &mut ThreadBlockBuildingContext,
         builder_name: String,
@@ -269,9 +270,27 @@ impl<
             PartialBlock::new_with_execution_tracer(discard_txs, partial_block_execution_tracer)
                 .with_tracer(GasUsedSimulationTracer::default());
         let mut block_state = BlockState::new_arc(state_provider);
+        // enable BAL accumulation for Amsterdam-active blocks. Per-tx
+        // commits will populate the BAL builder state on `BlockState`, and
+        // `take_built_bal()` at finalize emits the RLP-encoded list. Pre-Amsterdam
+        // we leave it disabled so revm doesn't pay the BAL bookkeeping cost.
+        let is_amsterdam = building_ctx
+            .chain_spec
+            .is_amsterdam_active_at_timestamp(building_ctx.attributes.timestamp());
+        if is_amsterdam {
+            block_state.enable_bal_builder();
+        }
         partial_block
             .pre_block_call(&building_ctx, local_ctx, &mut block_state)
             .map_err(|_| BlockBuildingHelperError::PreBlockCallFailed)?;
+        // EIP-7928: pre-execution system calls (blockhashes + beacon root)
+        // share `tx_index = 0`; the next access — the first regular tx —
+        // belongs to `tx_index = 1`. Bump now so commits of real txs go in
+        // at the right index. Reth's validator does the same after its
+        // `apply_pre_execution_changes` (payload_validator.rs:1064).
+        if is_amsterdam {
+            block_state.bump_bal_index();
+        }
         let payout_tx_space = estimate_payout_gas_limit(
             building_ctx.attributes.suggested_fee_recipient,
             &building_ctx,
@@ -483,6 +502,7 @@ impl<
             txs_blobs_sidecars: finalized_block.txs_blob_sidecars,
             execution_requests: finalized_block.execution_requests,
             bid_adjustments: finalized_block.bid_adjustments,
+            block_access_list: finalized_block.block_access_list,
         };
         Ok(FinalizeBlockResult { block })
     }

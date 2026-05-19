@@ -1,6 +1,7 @@
 pub mod base_config;
 pub mod block_list_provider;
 pub mod block_output;
+pub mod builder_api;
 pub mod building;
 pub mod cli;
 pub mod config;
@@ -15,6 +16,7 @@ pub mod watchdog;
 use crate::{
     building::{builders::BlockBuildingAlgorithm, BlockBuildingContext},
     live_builder::{
+        builder_api::EpbsBuilderServer,
         order_flow_tracing::order_flow_tracer_manager::OrderFlowTracerManager,
         order_input::{start_orderpool_jobs, OrderInputConfig},
         process_killer::ProcessKiller,
@@ -42,7 +44,8 @@ use reth::transaction_pool::{
     TransactionPool, TransactionValidator,
 };
 use reth_chainspec::ChainSpec;
-use reth_primitives::{Recovered, TransactionSigned};
+use reth_ethereum_primitives::TransactionSigned;
+use reth_primitives_traits::Recovered;
 use std::{
     cmp::min,
     fmt::Debug,
@@ -134,6 +137,15 @@ where
     pub simulation_use_random_coinbase: bool,
 
     pub order_flow_tracer_manager: Box<dyn OrderFlowTracerManager>,
+
+    /// Optional EPBS Builder API server (EIP-7732).
+    /// When set, the server will be spawned alongside the builder.
+    pub epbs_server: Option<EpbsBuilderServer>,
+
+    /// Optional EPBS P2P builder service.
+    /// When set, bids will be broadcast via p2p and payload envelopes
+    /// will be revealed after bid inclusion in beacon blocks.
+    pub epbs_p2p_service: Option<builder_api::EpbsP2PService>,
 }
 
 impl<P> LiveBuilder<P>
@@ -146,6 +158,28 @@ where
 
     pub fn with_builders(self, builders: Vec<Arc<dyn BlockBuildingAlgorithm<P>>>) -> Self {
         Self { builders, ..self }
+    }
+
+    /// Set the EPBS Builder API server.
+    ///
+    /// When set, the server will be spawned when `run()` is called and will
+    /// serve bids to proposers via the Builder API (EIP-7732).
+    pub fn with_epbs_server(self, server: EpbsBuilderServer) -> Self {
+        Self {
+            epbs_server: Some(server),
+            ..self
+        }
+    }
+
+    /// Set the EPBS P2P builder service.
+    ///
+    /// When set, the service will be spawned when `run()` is called and will
+    /// broadcast bids via p2p gossip and reveal payloads after bid inclusion.
+    pub fn with_epbs_p2p_service(self, service: builder_api::EpbsP2PService) -> Self {
+        Self {
+            epbs_p2p_service: Some(service),
+            ..self
+        }
     }
 
     pub async fn run(
@@ -233,8 +267,75 @@ where
             self.order_flow_tracer_manager,
         );
 
+        // Spawn EPBS Builder API server if configured
+        if let Some(epbs_server) = self.epbs_server {
+            let cancel = self.global_cancellation.clone();
+            info!(
+                listen_addr = %epbs_server.listen_addr(),
+                "Starting EPBS Builder API server"
+            );
+            inner_jobs_handles.push(tokio::spawn(async move {
+                if let Err(e) = epbs_server.run(cancel).await {
+                    error!(?e, "EPBS Builder API server error");
+                }
+            }));
+        }
+
+        // Spawn epbs p2p builder service if configured
+        if let Some(p2p_service) = self.epbs_p2p_service {
+            let cancel = self.global_cancellation.clone();
+            info!("Starting EPBS P2P builder service");
+            inner_jobs_handles.push(tokio::spawn(async move {
+                if let Err(e) = p2p_service.run(cancel).await {
+                    error!(?e, "EPBS P2P builder service error");
+                }
+            }));
+        }
+
         ready_to_build.store(true, Ordering::Relaxed);
-        while let Some(payload) = payload_events_channel.recv().await {
+        while let Some(mut payload) = payload_events_channel.recv().await {
+            // Fix A: Prysm's payload_attributes SSE wrapper adds
+            // `parent_block_number` as a convenience field. Pre-Gloas it carries the
+            // EL parent block number; post-Gloas it is often 0 because the previous
+            // slot's payload may be a pending builder bid that hasn't been revealed.
+            // The consensus-spec PayloadAttributes never had this field.
+            //
+            // Resolve the actual block number from the EL using `parent_block_hash`
+            // (which IS reliably populated). This matches buildoor's approach of
+            // letting the EL be the source of truth for block numbers.
+            // TODO: add proper fix for next local devnet testing
+            let parent_hash = payload.parent_block_hash();
+            match self.provider.header(&parent_hash) {
+                Ok(Some(header)) => {
+                    let resolved_number = header.number;
+                    let attr_number = payload.payload_attributes_event.data.parent_block_number;
+                    if attr_number != resolved_number {
+                        debug!(
+                            ?parent_hash,
+                            attr_number,
+                            resolved_number,
+                            "Resolved parent_block_number from EL (Gloas/EPBS quirk)"
+                        );
+                        payload.payload_attributes_event.data.parent_block_number = resolved_number;
+                    }
+                }
+                Ok(None) => {
+                    // parent not yet in our DB — keep whatever the sse event had.
+                    // fail with a clearer error if needed.
+                    debug!(
+                        ?parent_hash,
+                        "Parent header not found in EL while resolving parent_block_number"
+                    );
+                }
+                Err(e) => {
+                    warn!(
+                        ?parent_hash,
+                        error = ?e,
+                        "Failed to look up parent header for parent_block_number resolution"
+                    );
+                }
+            }
+
             let blocklist = self.blocklist_provider.get_blocklist()?;
             if blocklist.contains(&payload.fee_recipient()) {
                 warn!(

@@ -22,37 +22,217 @@ use reth::{
     consensus_common::validation::MAX_RLP_BLOCK_SIZE, revm::database::StateProviderDatabase,
 };
 use reth_errors::ProviderError;
+use reth_ethereum_primitives::Receipt;
 use reth_evm::{Evm, EvmEnv};
-use reth_primitives::Receipt;
 use reth_provider::{StateProvider, StateProviderBox};
 use revm::{
     context::result::{ExecutionResult, ResultAndState},
     context_interface::result::{EVMError, InvalidTransaction},
     database::{states::bundle_state::BundleRetention, BundleState, State},
+    database_interface::bal::BalState,
     Database as _, DatabaseCommit,
 };
 use std::{collections::HashMap, sync::Arc};
 use thiserror::Error;
+use tracing::debug;
+
+/// A thread safe wrapper around `StateProviderBox` that adds `Sync`.
+///
+/// reth removed `Sync` from `StateProvider` / `DbTx`, but rbuilder shares state
+/// providers across threads via `Arc`. The concrete MDBX-backed providers remain
+/// safe for concurrent reads, so we restore `Sync` here.
+///
+/// # Safety
+///
+/// The underlying provider must be safe for concurrent `&self` access.
+/// All reth database-backed providers satisfy this (MDBX read transactions).
+/// TODO: check if it can be replaced using reth crates
+pub struct SyncStateProvider(StateProviderBox);
+
+// SAFETY: The concrete reth providers backed by MDBX read-only transactions
+// are safe for concurrent read access from multiple threads.
+unsafe impl Sync for SyncStateProvider {}
+
+impl SyncStateProvider {
+    pub fn new(provider: StateProviderBox) -> Self {
+        Self(provider)
+    }
+
+    /// Access the inner provider (for methods not on StateProvider).
+    pub fn inner(&self) -> &(dyn StateProvider + Send) {
+        &*self.0
+    }
+}
+
+impl std::fmt::Debug for SyncStateProvider {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("SyncStateProvider").finish()
+    }
+}
+
+impl std::ops::Deref for SyncStateProvider {
+    type Target = StateProviderBox;
+    fn deref(&self) -> &StateProviderBox {
+        &self.0
+    }
+}
+
+// Implement all StateProvider supertraits and StateProvider itself by forwarding to the inner Box.
+
+impl reth_provider::BlockHashReader for SyncStateProvider {
+    fn block_hash(&self, number: u64) -> reth_errors::ProviderResult<Option<B256>> {
+        self.0.block_hash(number)
+    }
+    fn canonical_hashes_range(
+        &self,
+        start: u64,
+        end: u64,
+    ) -> reth_errors::ProviderResult<Vec<B256>> {
+        self.0.canonical_hashes_range(start, end)
+    }
+}
+
+impl reth_provider::AccountReader for SyncStateProvider {
+    fn basic_account(
+        &self,
+        address: &Address,
+    ) -> reth_errors::ProviderResult<Option<reth_primitives_traits::Account>> {
+        self.0.basic_account(address)
+    }
+}
+
+impl reth_provider::BytecodeReader for SyncStateProvider {
+    fn bytecode_by_hash(
+        &self,
+        code_hash: &B256,
+    ) -> reth_errors::ProviderResult<Option<reth_primitives_traits::Bytecode>> {
+        self.0.bytecode_by_hash(code_hash)
+    }
+}
+
+impl reth_provider::StateRootProvider for SyncStateProvider {
+    fn state_root(&self, state: reth_trie::HashedPostState) -> reth_errors::ProviderResult<B256> {
+        self.0.state_root(state)
+    }
+    fn state_root_from_nodes(
+        &self,
+        input: reth_trie::TrieInput,
+    ) -> reth_errors::ProviderResult<B256> {
+        self.0.state_root_from_nodes(input)
+    }
+    fn state_root_with_updates(
+        &self,
+        state: reth_trie::HashedPostState,
+    ) -> reth_errors::ProviderResult<(B256, reth_trie::updates::TrieUpdates)> {
+        self.0.state_root_with_updates(state)
+    }
+    fn state_root_from_nodes_with_updates(
+        &self,
+        input: reth_trie::TrieInput,
+    ) -> reth_errors::ProviderResult<(B256, reth_trie::updates::TrieUpdates)> {
+        self.0.state_root_from_nodes_with_updates(input)
+    }
+}
+
+impl reth_provider::StorageRootProvider for SyncStateProvider {
+    fn storage_root(
+        &self,
+        address: Address,
+        hashed_storage: reth_trie::HashedStorage,
+    ) -> reth_errors::ProviderResult<B256> {
+        self.0.storage_root(address, hashed_storage)
+    }
+    fn storage_proof(
+        &self,
+        address: Address,
+        slot: B256,
+        hashed_storage: reth_trie::HashedStorage,
+    ) -> reth_errors::ProviderResult<reth_trie::StorageProof> {
+        self.0.storage_proof(address, slot, hashed_storage)
+    }
+    fn storage_multiproof(
+        &self,
+        address: Address,
+        slots: &[B256],
+        hashed_storage: reth_trie::HashedStorage,
+    ) -> reth_errors::ProviderResult<reth_trie::StorageMultiProof> {
+        self.0.storage_multiproof(address, slots, hashed_storage)
+    }
+}
+
+impl reth_provider::StateProofProvider for SyncStateProvider {
+    fn proof(
+        &self,
+        input: reth_trie::TrieInput,
+        address: Address,
+        slots: &[B256],
+    ) -> reth_errors::ProviderResult<reth_trie::AccountProof> {
+        self.0.proof(input, address, slots)
+    }
+    fn multiproof(
+        &self,
+        input: reth_trie::TrieInput,
+        targets: reth_trie::MultiProofTargets,
+    ) -> reth_errors::ProviderResult<reth_trie::MultiProof> {
+        self.0.multiproof(input, targets)
+    }
+    fn witness(
+        &self,
+        input: reth_trie::TrieInput,
+        target: reth_trie::HashedPostState,
+        mode: reth_trie::ExecutionWitnessMode,
+    ) -> reth_errors::ProviderResult<Vec<alloy_primitives::Bytes>> {
+        self.0.witness(input, target, mode)
+    }
+}
+
+impl reth_provider::HashedPostStateProvider for SyncStateProvider {
+    fn hashed_post_state(&self, bundle_state: &BundleState) -> reth_trie::HashedPostState {
+        self.0.hashed_post_state(bundle_state)
+    }
+}
+
+impl StateProvider for SyncStateProvider {
+    fn storage(
+        &self,
+        account: Address,
+        storage_key: alloy_primitives::StorageKey,
+    ) -> reth_errors::ProviderResult<Option<alloy_primitives::StorageValue>> {
+        self.0.storage(account, storage_key)
+    }
+}
+
+/// Helper to convert `EvmDatabaseError<ProviderError>` to `ProviderError`.
+fn map_evm_db_error(
+    e: revm::database_interface::bal::EvmDatabaseError<ProviderError>,
+) -> ProviderError {
+    match e {
+        revm::database_interface::bal::EvmDatabaseError::Database(e) => e,
+        revm::database_interface::bal::EvmDatabaseError::Bal(e) => ProviderError::other(e),
+    }
+}
 
 #[derive(Clone)]
 pub struct BlockState {
-    provider: Arc<dyn StateProvider>,
+    provider: Arc<SyncStateProvider>,
     bundle_state: Option<BundleState>,
+    bal_state: Option<BalState>,
 }
 
 impl BlockState {
     pub fn new(provider: StateProviderBox) -> Self {
-        Self::new_arc(Arc::from(provider))
+        Self::new_arc(Arc::new(SyncStateProvider::new(provider)))
     }
 
-    pub fn new_arc(provider: Arc<dyn StateProvider>) -> Self {
+    pub fn new_arc(provider: Arc<SyncStateProvider>) -> Self {
         Self {
             provider,
             bundle_state: Some(BundleState::default()),
+            bal_state: Some(BalState::default()),
         }
     }
 
-    pub fn into_provider(self) -> Arc<dyn StateProvider> {
+    pub fn into_provider(self) -> Arc<SyncStateProvider> {
         self.provider
     }
 
@@ -61,7 +241,7 @@ impl BlockState {
         self
     }
 
-    pub fn into_parts(self) -> (BundleState, Arc<dyn StateProvider>) {
+    pub fn into_parts(self) -> (BundleState, Arc<SyncStateProvider>) {
         (self.bundle_state.unwrap(), self.provider)
     }
 
@@ -73,12 +253,68 @@ impl BlockState {
         self.bundle_state.as_mut().unwrap()
     }
 
-    pub fn state_provider(&self) -> Arc<dyn StateProvider> {
+    pub fn state_provider(&self) -> Arc<SyncStateProvider> {
         self.provider.clone()
     }
 
     pub fn clone_bundle(&self) -> BundleState {
         self.bundle_state.clone().unwrap()
+    }
+
+    /// enable per tx BAL accumulation. Call this once at block build start
+    /// when the chainspecs amsterdam fork is active for the building slots
+    /// timestamp. Without this, `take_built_bal()` always returns `None`.
+    pub fn enable_bal_builder(&mut self) {
+        if let Some(state) = self.bal_state.as_mut() {
+            *state = std::mem::take(state).with_bal_builder();
+        }
+    }
+
+    /// Advance the EIP-7928 BAL `tx_index` counter. EIP-7928 tags every BAL
+    /// entry with the transaction index at which the access occurred — pre-
+    /// execution system calls share index 0, then the index bumps to 1 for tx
+    /// 0, to 2 for tx 1, and so on. Reth's validator bumps the index after
+    /// `apply_pre_execution_changes` and after each `execute_transaction`
+    /// (see crates/engine/tree/src/tree/payload_validator.rs:1064,1113), so
+    /// we must do the same on the builder side or the BAL bytes our
+    /// `take_built_bal()` emits will hash differently from the validator's
+    /// re-derived BAL → `block_access_list_hash mismatch`.
+    pub fn bump_bal_index(&mut self) {
+        if let Some(state) = self.bal_state.as_mut() {
+            state.bump_bal_index();
+        }
+    }
+
+    /// Extract the accumulated EIP-7928 Block Access List. Returns `None`
+    /// if `enable_bal_builder()` was never called for this block.
+    ///
+    /// Returns the canonical `alloy_eip7928::Bal` (wrapper around
+    /// `Vec<AccountChanges>`) so the caller can both:
+    ///   * compute `header.block_access_list_hash` via
+    ///     `alloy_eips::eip7928::compute_block_access_list_hash` — the
+    ///     same free function reth's `validate_block_post_execution`
+    ///     uses (consensus/src/validation.rs:93), and
+    ///   * RLP-encode the bytes for the envelope payload field.
+    pub fn take_built_bal(&mut self) -> Option<alloy_eips::eip7928::BlockAccessList> {
+        let bal = self.bal_state.as_mut()?.take_built_alloy_bal()?;
+        // Gated so we don't pay the encode_list + keccak256 cost every
+        // finalize iteration (~50/slot) when debug logging is off. Keep
+        // hash + hex preview so that a future `block_access_list_hash
+        // mismatch` can be diffed byte-for-byte against reth's BAL.
+        if tracing::enabled!(tracing::Level::DEBUG) {
+            let mut bytes_buf = Vec::new();
+            alloy_rlp::encode_list(bal.as_slice(), &mut bytes_buf);
+            let hash = alloy_eips::eip7928::compute_block_access_list_hash(bal.as_slice());
+            let preview_len = bytes_buf.len().min(128);
+            debug!(
+                bal_len = bytes_buf.len(),
+                bal_account_count = bal.len(),
+                bal_hash = %hash,
+                bal_hex_head = %alloy_primitives::hex::encode(&bytes_buf[..preview_len]),
+                "Built block access list"
+            );
+        }
+        Some(bal)
     }
 
     pub fn new_db_ref<'a, 'b, 'c>(
@@ -89,12 +325,16 @@ impl BlockState {
         let state_provider = StateProviderDatabase::new(&self.provider);
         let cachedb = CachedDB::new(state_provider, local_cache_reads, shared_cache_reads);
         let bundle_state = self.bundle_state.take().unwrap();
-        let db = State::builder()
+        // Carry the persistent BAL builder state (if any) into the freshly built
+        // revm State so EIP-7928 BAL accumulation continues across per-tx calls.
+        let bal_state = self.bal_state.take().unwrap_or_default();
+        let mut db = State::builder()
             .with_database(cachedb)
             .with_bundle_prestate(bundle_state)
             .with_bundle_update()
             .build();
-        BlockStateDBRef::new(db, &mut self.bundle_state)
+        db.bal_state = bal_state;
+        BlockStateDBRef::new(db, &mut self.bundle_state, &mut self.bal_state)
     }
 
     pub fn balance(
@@ -106,7 +346,8 @@ impl BlockState {
         let mut db = self.new_db_ref(shared_cache_reads, local_cache_reads);
         Ok(db
             .as_mut()
-            .basic(address)?
+            .basic(address)
+            .map_err(map_evm_db_error)?
             .map(|acc| acc.balance)
             .unwrap_or_default())
     }
@@ -120,7 +361,8 @@ impl BlockState {
         let mut db = self.new_db_ref(shared_cache_reads, local_cache_reads);
         Ok(db
             .as_mut()
-            .basic(address)?
+            .basic(address)
+            .map_err(map_evm_db_error)?
             .map(|acc| acc.nonce)
             .unwrap_or_default())
     }
@@ -134,7 +376,8 @@ impl BlockState {
         let mut db = self.new_db_ref(shared_cache_reads, local_cache_reads);
         Ok(db
             .as_mut()
-            .basic(address)?
+            .basic(address)
+            .map_err(map_evm_db_error)?
             .map(|acc| acc.code_hash)
             .unwrap_or_else(|| KECCAK_EMPTY))
     }
@@ -156,23 +399,31 @@ impl BlockState {
     }
 }
 
-/// A wrapper around a [`State`] that will return the [`BundleState`] back to [`BlockState`] when dropped.
+/// A wrapper around a [`State`] that returns the [`BundleState`] and the
+/// [`BalState`] back to [`BlockState`] when dropped, so both accumulate across
+/// per-tx calls to `new_db_ref`.
 pub struct BlockStateDBRef<'a, DB>
 where
     DB: Database<Error = ProviderError>,
 {
     db: State<DB>,
     parent_bundle_state_ref: &'a mut Option<BundleState>,
+    parent_bal_state_ref: &'a mut Option<BalState>,
 }
 
 impl<'a, DB> BlockStateDBRef<'a, DB>
 where
     DB: Database<Error = ProviderError>,
 {
-    pub fn new(db: State<DB>, parent_bundle_state_ref: &'a mut Option<BundleState>) -> Self {
+    pub fn new(
+        db: State<DB>,
+        parent_bundle_state_ref: &'a mut Option<BundleState>,
+        parent_bal_state_ref: &'a mut Option<BalState>,
+    ) -> Self {
         Self {
             db,
             parent_bundle_state_ref,
+            parent_bal_state_ref,
         }
     }
 
@@ -186,7 +437,11 @@ where
     DB: Database<Error = ProviderError>,
 {
     fn drop(&mut self) {
-        *self.parent_bundle_state_ref = Some(self.db.take_bundle())
+        *self.parent_bundle_state_ref = Some(self.db.take_bundle());
+        // Move the BAL state back to the parent so the next `new_db_ref` call
+        // continues accumulating into the same BAL. `mem::take` is fine
+        // because revm's `BalState::default()` is a valid empty state.
+        *self.parent_bal_state_ref = Some(std::mem::take(&mut self.db.bal_state));
     }
 }
 
@@ -433,6 +688,17 @@ pub struct PartialBlockFork<
 
 pub struct PartialBlockRollobackPoint {
     rollobacks: usize,
+    /// Snapshot of the EIP-7928 BAL accumulator at rollback creation.
+    /// `Some` only when BAL building is enabled (Amsterdam+). The BalState
+    /// itself has no revert API: `bal_state.commit()` mutates the builder
+    /// (appends per-account entries) and `bump_bal_index` advances a counter.
+    /// If a bundle/order partially commits and then fails, those mutations
+    /// leak into the final BAL — every leaked entry tags with a `tx_index`
+    /// that doesn't match the validator's re-execution (which never sees
+    /// the rolled-back txs), producing `block_access_list_hash mismatch`.
+    /// Restoring this snapshot on `rollback()` keeps our BAL in lockstep
+    /// with what the block's transaction list will commit.
+    bal_snapshot: Option<revm::database_interface::bal::BalState>,
 }
 
 #[derive(Debug, Clone)]
@@ -456,7 +722,9 @@ pub enum CriticalCommitOrderError {
     #[error("Reth error: {0}")]
     Reth(#[from] ProviderError),
     #[error("EVM error: {0}")]
-    EVM(#[from] EVMError<ProviderError>),
+    EVM(#[from] EVMError<revm::database_interface::bal::EvmDatabaseError<ProviderError>>),
+    #[error("EVM database error: {0}")]
+    EvmDB(#[from] revm::database_interface::bal::EvmDatabaseError<ProviderError>),
     /// This could happen if we can't fit a balance in a I256 (unlikely/impossible since the ETH total supply is several orders of magnitude bellow I256::max)
     #[error("BigIntConversionError error: {0}")]
     BigIntConversionError(#[from] alloy_primitives::BigIntConversionError),
@@ -491,8 +759,19 @@ impl<
     }
 
     pub fn rollback_point(&self) -> PartialBlockRollobackPoint {
+        // Only snapshot when the BAL builder is active — pre-Amsterdam this
+        // is `None` and the clone is essentially free. Post-Amsterdam the
+        // BalState carries the accumulated `Vec<AccountChanges>` plus the
+        // running `bal_index`, both of which must be restored on rollback.
+        let bal_snapshot = self
+            .state
+            .bal_state
+            .as_ref()
+            .filter(|s| s.bal_builder.is_some())
+            .cloned();
         PartialBlockRollobackPoint {
             rollobacks: self.rollbacks,
+            bal_snapshot,
         }
     }
 
@@ -503,6 +782,14 @@ impl<
             .expect("incorrect rollback");
         let bundle_state = self.state.bundle_state.as_mut().expect("no bundle state");
         bundle_state.revert(rollbacks);
+        // Restore the BAL accumulator alongside the bundle state. The BAL
+        // has no revert API of its own, so we replay the snapshot we took
+        // before this order ran. Without this every rolled-back bundle
+        // leaves stale entries + advanced bal_index in the accumulator
+        // and the validator's re-derived BAL hashes differently.
+        if let Some(snapshot) = rollback_point.bal_snapshot {
+            self.state.bal_state = Some(snapshot);
+        }
         self.rollbacks = rollback_point.rollobacks;
     }
 
@@ -670,8 +957,12 @@ impl<
             Err(err) => return Ok(Err(err)),
         };
 
+        let tx_gas_used = res.result.tx_gas_used();
+        let regular_gas_used = res.result.gas().block_regular_gas_used();
+        let state_gas_used = res.result.gas().block_state_gas_used();
+
         if let Some(tracer) = &mut self.tracer {
-            tracer.add_gas_used(res.result.gas_used());
+            tracer.add_gas_used(tx_gas_used);
             if let (true, Some(t)) = (is_recording_used_state, used_state_trace) {
                 tracer.add_used_state_trace(t)
             }
@@ -682,10 +973,22 @@ impl<
         // This allows calling saturating_coinbase_delta. @Pending: this should be a scope/child function.
         drop(db);
         self.rollbacks += 1;
+        // EIP-7928: advance the BAL `tx_index` after each successfully
+        // committed transaction. Matches reth-validator's per-tx bump
+        // (crates/engine/tree/src/tree/payload_validator.rs:1113). Without
+        // this every tx's accesses are tagged with the same index, the
+        // re-derived BAL on the validator side does not, and the resulting
+        // RLP bytes hash differently → `block_access_list_hash mismatch`
+        // on reveal.
+        self.state.bump_bal_index();
 
-        // add gas used by the transaction to cumulative gas used, before creating the receipt
-        let space_used = BlockSpace::new(
-            res.result.gas_used(),
+        // Track regular and state gas separately for EIP-8037 header semantics
+        // while keeping `gas = tx_gas_used` so receipt cumulative_gas_used stays
+        // correct.
+        let space_used = BlockSpace::new_split(
+            tx_gas_used,
+            regular_gas_used,
+            state_gas_used,
             tx_with_blobs.internal_tx_unsecure().length(),
             blob_gas_used,
         );
@@ -1155,7 +1458,7 @@ fn execute_evm<Factory>(
     evm_env: EvmEnv,
     tx_with_blobs: &TransactionSignedEcRecoveredWithBlobs,
     used_state_tracer: Option<&mut UsedStateTrace>,
-    db: impl Database<Error = ProviderError>,
+    db: impl Database<Error = revm::database_interface::bal::EvmDatabaseError<ProviderError>>,
     blocklist: &HashSet<Address>,
 ) -> Result<Result<ResultAndState, TransactionErr>, CriticalCommitOrderError>
 where
@@ -1171,9 +1474,10 @@ where
             EVMError::Transaction(tx_err) => {
                 return Ok(Err(TransactionErr::InvalidTransaction(tx_err)))
             }
-            EVMError::Database(_) | EVMError::Header(_) | EVMError::Custom(_) => {
-                return Err(err.into())
-            }
+            EVMError::Database(_)
+            | EVMError::Header(_)
+            | EVMError::Custom(_)
+            | EVMError::CustomAny(_) => return Err(err.into()),
         },
     };
     drop(evm);
